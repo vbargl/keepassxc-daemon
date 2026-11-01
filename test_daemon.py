@@ -54,27 +54,69 @@ class DaemonTest(unittest.TestCase):
                         output += os.read(terminal, 65536)
                     except OSError:
                         self.fail("daemon exited during startup")
-                self.assertIsNone(process.poll(), "daemon exited during startup")
+                if token not in output:
+                    self.assertIsNone(process.poll(), "daemon exited during startup")
         finally:
             selector.close()
+        return output
 
-    def launch(self, database, path, password):
-        master, slave = pty.openpty()
+    def start_server(self, path, nohup=False):
+        command = [sys.executable, str(SCRIPT), "--socket", str(path), "serve"]
+        if nohup:
+            command.insert(0, "nohup")
         process = subprocess.Popen(
-            [sys.executable, str(SCRIPT), "--socket", str(path), "serve", str(database)],
-            stdin=slave, stdout=slave, stderr=slave,
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, start_new_session=True, bufsize=0,
         )
-        os.close(slave)
+        output = os.dup(process.stdout.fileno())
+        process.stdout.close()
         try:
-            self.wait_for(master, process, b"Database password (hidden): ")
-            os.write(master, password.encode() + b"\n")
-            self.wait_for(master, process, b"Ready: ")
+            self.wait_for(output, process, b"Ready: ")
         except BaseException:
             process.terminate()
             process.wait(timeout=5)
-            os.close(master)
+            os.close(output)
             raise
-        return process, master
+        return process, output
+
+    def open_database(self, path, database, password, expected_code=0, cwd=None):
+        master, slave = pty.openpty()
+        process = subprocess.Popen(
+            [sys.executable, str(SCRIPT), "--socket", str(path), "open", str(database)],
+            stdin=slave, stdout=slave, stderr=slave, cwd=cwd,
+        )
+        os.close(slave)
+        output = b""
+        try:
+            prompt = self.wait_for(master, process, b"Database password (hidden): ")
+            os.write(master, password.encode() + b"\n")
+            self.assertEqual(process.wait(timeout=15), expected_code, "open client failed")
+            while True:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                output += data
+            self.assertFalse(password.encode() in prompt + output, "open client echoed the password")
+            return json.loads(output.strip()) if expected_code == 0 else None
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+            os.close(master)
+
+    def launch(self, database, path, password):
+        process, output = self.start_server(path)
+        try:
+            self.open_database(path, database, password)
+        except BaseException:
+            process.terminate()
+            process.wait(timeout=5)
+            os.close(output)
+            raise
+        return process, output
 
     def test_end_to_end(self):
         with tempfile.TemporaryDirectory(prefix="keepassxc-daemon-test-") as directory:
@@ -141,7 +183,7 @@ class DaemonTest(unittest.TestCase):
                 self.assertEqual(bridge.exchange(path, {"op": "status"})["cli_pid"], cli_pid)
 
                 second = subprocess.run(
-                    [sys.executable, str(SCRIPT), "--socket", str(path), "serve", str(database)],
+                    [sys.executable, str(SCRIPT), "--socket", str(path), "serve"],
                     stdin=subprocess.DEVNULL, capture_output=True, timeout=5,
                 )
                 self.assertEqual(second.returncode, 1)
@@ -173,7 +215,7 @@ class DaemonTest(unittest.TestCase):
             process, terminal = self.launch(database, path, password)
             try:
                 self.assertEqual(bridge.exchange(path, {"op": "search", "query": "Wi-Fi"})["entries"], ["/" + entry])
-                process.send_signal(signal.SIGHUP)
+                process.terminate()
                 self.assertEqual(process.wait(timeout=5), 0)
                 self.assertFalse(path.exists())
             finally:
@@ -185,6 +227,87 @@ class DaemonTest(unittest.TestCase):
             with self.assertRaises(bridge.SessionError):
                 bridge.Session(database, secrets.token_urlsafe(32))
             self.assertFalse(path.exists())
+
+    def test_background_server_and_separate_open(self):
+        with tempfile.TemporaryDirectory(prefix="keepassxc-daemon-test-") as directory:
+            root = Path(directory)
+            database, other, path = root / "one.kdbx", root / "two.kdbx", root / "runtime" / "cli.sock"
+            password, second_password = (secrets.token_urlsafe(32) for _ in range(2))
+            self.create_database(database, password)
+            self.create_database(other, second_password)
+            self.set_entry(database, password, "First entry", secrets.token_urlsafe(32))
+            self.set_entry(other, second_password, "Second entry", secrets.token_urlsafe(32))
+            process, output = self.start_server(path, nohup=True)
+            try:
+                empty = bridge.exchange(path, {"op": "status"})
+                self.assertFalse(empty["database_open"])
+                self.assertFalse(empty["unlocked"])
+                self.assertIsNone(empty["cli_pid"])
+                self.assertEqual(empty["pid"], process.pid)
+                for request in [{"op": "search", "query": "*"}, {"op": "get", "entry": "anything"}, {"op": "reload"}]:
+                    with self.assertRaises(bridge.BridgeError):
+                        bridge.exchange(path, request)
+                for invalid_password in [None, [], "wrong\nexit", "wrong\rnext"]:
+                    with self.assertRaises(bridge.BridgeError):
+                        bridge.exchange(path, {"op": "open", "database": str(database), "password": invalid_password})
+                noninteractive = subprocess.run(
+                    [sys.executable, str(SCRIPT), "--socket", str(path), "open", str(database)],
+                    stdin=subprocess.DEVNULL, capture_output=True, timeout=5,
+                )
+                self.assertEqual(noninteractive.returncode, 1)
+                self.assertFalse(bridge.exchange(path, {"op": "status"})["database_open"])
+
+                # No terminal is attached to the server. nohup must remain effective.
+                process.send_signal(signal.SIGHUP)
+                self.assertEqual(bridge.exchange(path, {"op": "status"})["pid"], process.pid)
+
+                self.open_database(path, database, secrets.token_urlsafe(32), expected_code=1)
+                self.assertFalse(bridge.exchange(path, {"op": "status"})["database_open"])
+                opened = self.open_database(path, Path("one.kdbx"), password, cwd=root)
+                self.assertTrue(opened["opened"])
+                self.assertEqual(opened["pid"], process.pid)
+                self.assertEqual(bridge.exchange(path, {"op": "search", "query": "*"})["entries"], ["/First entry"])
+
+                self.open_database(path, other, secrets.token_urlsafe(32), expected_code=1)
+                self.assertEqual(bridge.exchange(path, {"op": "status"})["cli_pid"], opened["cli_pid"])
+                self.assertEqual(bridge.exchange(path, {"op": "search", "query": "*"})["entries"], ["/First entry"])
+                replacement = self.open_database(path, other, second_password)
+                self.assertEqual(replacement["pid"], process.pid)
+                self.assertNotEqual(replacement["cli_pid"], opened["cli_pid"])
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(opened["cli_pid"], 0)
+                self.assertEqual(bridge.exchange(path, {"op": "search", "query": "*"})["entries"], ["/Second entry"])
+
+                # An exited backend leaves the daemon ready for another open.
+                os.kill(replacement["cli_pid"], signal.SIGKILL)
+                time.sleep(.1)
+                self.assertFalse(bridge.exchange(path, {"op": "status"})["database_open"])
+                self.assertIsNone(process.poll())
+                self.open_database(path, database, password)
+                self.assertTrue(bridge.exchange(path, {"op": "status"})["database_open"])
+                bridge.exchange(path, {"op": "stop"})
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertFalse(path.exists())
+                logs = os.read(output, 65536)
+                self.assertFalse(password.encode() in logs, "server logged an unlock password")
+                self.assertFalse(second_password.encode() in logs, "server logged an unlock password")
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+                os.close(output)
+
+            # Empty servers can also stop cleanly without ever unlocking a database.
+            process, output = self.start_server(path)
+            try:
+                bridge.exchange(path, {"op": "stop"})
+                self.assertEqual(process.wait(timeout=5), 0)
+                self.assertFalse(path.exists())
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                    process.wait(timeout=10)
+                os.close(output)
 
     def test_reload_saved_edits_replacement_and_failures(self):
         with tempfile.TemporaryDirectory(prefix="keepassxc-daemon-test-") as directory:

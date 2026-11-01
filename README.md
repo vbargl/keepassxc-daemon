@@ -1,8 +1,9 @@
 # keepassxc-daemon
 
 A read-only Linux daemon that keeps one `keepassxc-cli` session unlocked and makes
-it available over a private Unix socket. Unlock once in your terminal, then search
-entry titles or pass a selected field directly to another process.
+it available over a private Unix socket. Start the server without a database or
+terminal input, then unlock a database from a separate terminal client. Subsequent
+requests can search entry titles or pass a selected field directly to a process.
 
 Saved database changes reload automatically. The daemon checks the file every
 second while idle and before reading an entry. It handles both normal saves and
@@ -38,28 +39,58 @@ python3 keepassxc_daemon.py --help
 For the commands below, substitute `python3 keepassxc_daemon.py` for
 `keepassxc-daemon` when running from source.
 
-## Start
+## Start the server
 
-Run in a regular terminal as your normal user:
+Run as your normal user, in the foreground or under a user service manager:
 
 ```sh
-keepassxc-daemon serve "/path/to/database.kdbx"
+keepassxc-daemon serve
 ```
 
-Enter the database password at the hidden prompt. Once it prints `Ready:`, leave
-that terminal open. All later client requests reuse the unlocked session.
+`serve` takes no database argument, never prompts, and does not read stdin. Once
+it prints `Ready:`, the private socket is listening. Initially no database is open.
+It stays running after an `open` client disconnects or a CLI database session exits.
+
+For a shell background launch that survives terminal hangup:
+
+```sh
+nohup keepassxc-daemon serve </dev/null >/dev/null 2>&1 &
+```
+
+It can also run as a `systemd --user` service whose `ExecStart` invokes
+`keepassxc-daemon serve`. Database selection and unlocking belong in the client,
+not the service unit or its environment.
+
+## Open a database
+
+In another terminal:
+
+```sh
+keepassxc-daemon open "/path/to/database.kdbx"
+```
+
+Enter the database password at the hidden prompt in this client terminal. The
+client sends it to the running server through the private Unix socket and exits
+after opening succeeds. All later requests reuse the server's unlocked session.
+Relative database and key-file paths are resolved in the client's working directory.
 
 For additional unlock factors:
 
 ```sh
-keepassxc-daemon serve "/path/to/database.kdbx" --key-file "/path/to/keyfile"
-keepassxc-daemon serve "/path/to/database.kdbx" --yubikey 1
+keepassxc-daemon open "/path/to/database.kdbx" --key-file "/path/to/keyfile"
+keepassxc-daemon open "/path/to/database.kdbx" --yubikey 1
 ```
 
+One database is open at a time. Another `open` replaces the existing session only
+after the new database unlocks successfully. A failed `open` leaves an existing
+session in place. After a backend session exits, use `open` again; the server does
+not need restarting.
+
 The master password is retained in a memory-locked buffer for automatic reloads.
-It is sent to each CLI session through an anonymous pipe, never saved in a file,
-log, environment variable, or command argument. The retained buffer is zeroed on
-shutdown. Core dumps are disabled and the daemon disables ordinary process dumps.
+It travels from client to server over the Unix socket, then to each CLI session
+through an anonymous pipe. It is never saved in a file, log, environment variable,
+or command argument. The retained buffer is zeroed on shutdown or when replacing
+the open database. Core dumps are disabled and ordinary process dumps are disabled.
 
 ## Search and status
 
@@ -74,9 +105,11 @@ keepassxc-daemon search '*'
 Search accepts KeePassXC search syntax and returns entry paths/titles, including
 non-web entries. It prints no password values. No matches produces an empty list.
 
-`status` reads no entries. Its JSON response includes `unlocked`, `auto_reload`,
-`reload_count`, `reload_error`, and the daemon and CLI process IDs. The daemon
-process ID stays the same across reloads; the CLI process ID changes.
+`status` reads no entries. Its JSON response includes `database_open`, `unlocked`,
+`auto_reload`, `reload_count`, `reload_error`, and the daemon and CLI process IDs.
+Before `open`, `database_open` and `unlocked` are false and `cli_pid` is null.
+Search, secret reads and reload require an open database. The daemon process ID
+stays the same across opens and reloads; the CLI process ID changes.
 
 ## Reload saved changes
 
@@ -93,8 +126,8 @@ If loading fails, the old snapshot is not served: searches and secret reads paus
 and `status` reports `unlocked: false` with a `reload_error`. The daemon retries
 after another file change, or when explicitly asked to reload.
 
-If you change the database password or required unlock factors, stop and restart
-the daemon to enter the new factors. Hardware that requires touch confirmation
+If you change the database password or required unlock factors, use `open` again
+to enter the new factors. Hardware that requires touch confirmation
 may require another touch during a reload. The bridge itself never writes the
 database and never changes its unlock factors.
 
@@ -121,8 +154,9 @@ Press Ctrl+C in the server terminal, or run:
 keepassxc-daemon stop
 ```
 
-The server exits its CLI session, reaps the process, wipes its retained unlock
-password, and removes the socket. Starting it again requires another unlock.
+The server exits any open CLI session, reaps the process, wipes its retained unlock
+password, and removes the socket. After starting the server again, use `open` to
+unlock a database. `stop` also works before any database has been opened.
 
 The daemon has an independent unlocked session: locking KeePassXC Desktop does
 not lock this daemon. SSH agent integration, browser integration, Secret Service,
@@ -142,6 +176,7 @@ Send one JSON request per connection, terminated by a newline:
 
 ```json
 {"op":"status"}
+{"op":"open","database":"/absolute/path/database.kdbx","password":"<provided privately by the client>"}
 {"op":"search","query":"router"}
 {"op":"get","entry":"/Servers/example","attribute":"Password"}
 {"op":"reload"}
@@ -149,14 +184,17 @@ Send one JSON request per connection, terminated by a newline:
 ```
 
 Responses have `ok: true` and operation-specific fields, or `ok: false` and an
-`error`. `search` returns `entries`; `get` returns `value`; `reload` returns
+`error`. `open` returns `opened` and the status fields; it accepts optional
+`key_file` (an absolute path) and `yubikey`. Do not put real `open` requests in chat
+or logs. `search` returns `entries`; `get` returns `value`; `reload` returns
 `reloaded` and the status fields. `get` sends the selected secret over the private
 socket to the calling program. Do not put raw `get` responses in chat or logs.
 
 The API exposes these operations only, not arbitrary CLI commands. Requests are
 serialized. Control characters in command arguments are rejected. Framing errors
-and timeouts during entry reads close the session rather than reuse an uncertain
-CLI stream. Reload errors pause reads while allowing status, retry and stop.
+and timeouts during entry reads close the database session rather than reuse an
+uncertain CLI stream; the server stays available for another `open`. Reload errors
+pause reads while allowing status, retry, open and stop.
 
 Any process running as your Unix user can use this socket. Isolation is between
 Unix users, not between applications sharing the same user account.
@@ -171,7 +209,8 @@ Tests create disposable encrypted databases with generated fixture credentials.
 They cover persistent access, quoting and framing, secret injection into a child,
 local permissions, invalid requests, cleanup, saved edits, atomic replacement,
 manual reload, reload races, missing/corrupt databases, changed unlock factors,
-and password-buffer wiping. They do not open your real database or print fixture
-passwords.
+password-buffer wiping, startup without a terminal/database, separate interactive
+opens, database replacement, failed opens and surviving terminal hangup under
+`nohup`. They do not open your real database or print fixture passwords.
 
 Licensed under MIT; see [LICENSE](LICENSE).

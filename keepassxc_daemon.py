@@ -113,10 +113,10 @@ class Session:
     def read(self, deadline):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise SessionError("CLI timed out; restart the daemon")
+            raise SessionError("CLI timed out; open the database again")
         events = self.selector.select(remaining)
         if not events:
-            raise SessionError("CLI timed out; restart the daemon")
+            raise SessionError("CLI timed out; open the database again")
         chunks = []
         for key, _ in events:
             data = os.read(key.fileobj.fileno(), 65536)
@@ -141,7 +141,7 @@ class Session:
                 else:
                     errors += data
             if len(output) + len(errors) > LIMIT:
-                raise SessionError("CLI response too large; restart the daemon")
+                raise SessionError("CLI response too large; open the database again")
         # The diagnostic is emitted after stdout has been flushed. Drain stdout
         # until its echoed marker arrives; later prompts stay in pending.
         delimiter = self.prompt + boundary
@@ -150,11 +150,11 @@ class Session:
                 if stream == "out":
                     output += data
             if len(output) > LIMIT:
-                raise SessionError("CLI response too large; restart the daemon")
+                raise SessionError("CLI response too large; open the database again")
         payload, self.pending = output.split(delimiter, 1)
         prefix = self.prompt + wire + b"\n"
         if not payload.startswith(prefix):
-            raise SessionError("CLI framing changed; restart the daemon")
+            raise SessionError("CLI framing changed; open the database again")
         # Only the deliberately unknown marker command may produce a diagnostic.
         diagnostics = [line for line in errors.splitlines() if line and marker.encode() not in line]
         if command.startswith("search -- ") and diagnostics == [b"No results for that search term."]:
@@ -233,7 +233,7 @@ class ReloadingSession:
                 candidate.close()
             if not isinstance(error, (BridgeError, OSError, ValueError)):
                 raise
-            self.reload_error = "Database reload failed; reads paused. Retry reload after saving, or restart if unlock factors changed"
+            self.reload_error = "Database reload failed; reads paused. Retry reload after saving, or use open if unlock factors changed"
             return False
         previous = self.session
         self.session = candidate
@@ -254,6 +254,7 @@ class ReloadingSession:
 
     def status(self):
         return {
+            "database_open": True,
             "unlocked": self.reload_error is None,
             "pid": os.getpid(),
             "cli_pid": self.process.pid,
@@ -290,6 +291,28 @@ def exchange(path, request):
     return response
 
 
+def open_request(request):
+    """Validate opening parameters without echoing secret input in errors."""
+    database = request.get("database")
+    argument(database)
+    database = Path(database)
+    if not database.is_absolute() or not database.is_file():
+        raise BridgeError("Database must be an existing absolute file path")
+    key_file = request.get("key_file")
+    if key_file is not None:
+        argument(key_file)
+        key_file = Path(key_file)
+        if not key_file.is_absolute() or not key_file.is_file():
+            raise BridgeError("Key file must be an existing absolute file path")
+    yubikey = request.get("yubikey")
+    if yubikey is not None:
+        argument(yubikey)
+    password = request.pop("password", None)
+    if not isinstance(password, str) or len(password) > 4096 or any(c in password for c in "\r\n"):
+        raise BridgeError("Expected a single-line unlock password")
+    return ReloadingSession(database, password, key_file, yubikey)
+
+
 def serve(args):
     os.umask(0o077)
     directory = args.socket.parent
@@ -312,26 +335,20 @@ def serve(args):
             if not stat.S_ISSOCK(info.st_mode) or info.st_uid != os.getuid():
                 raise BridgeError("Refusing to replace a non-socket or another user's socket")
             args.socket.unlink()
-        if not args.database.is_file():
-            raise BridgeError("Database file does not exist")
-        if not sys.stdin.isatty():
-            raise BridgeError("Start serve in a terminal to enter the database password privately")
-        password = getpass.getpass("Database password (hidden): ")
-        try:
-            session = ReloadingSession(args.database, password, args.key_file, args.yubikey)
-        finally:
-            password = None
         listener.bind(str(args.socket))
         bound = True
         os.chmod(args.socket, 0o600)
         listener.listen(4)
         listener.settimeout(1)
-        print(f"Ready: {args.socket}\nDatabase stays unlocked here. Ctrl+C or the stop command closes it.", flush=True)
+        print(f"Ready: {args.socket}\nUse open to unlock a database from another terminal.", flush=True)
         running = True
         while running:
-            session.refresh()
-            if session.process.poll() is not None:
-                raise BridgeError("CLI exited; restart the daemon")
+            if session is not None:
+                session.refresh()
+                if session.process.poll() is not None:
+                    session.close()
+                    session = None
+                    print("Database session closed. Use open to unlock it again.", flush=True)
             try:
                 connection, _ = listener.accept()
             except socket.timeout:
@@ -347,10 +364,36 @@ def serve(args):
                         if len(raw) > 65536 or not raw.endswith(b"\n"):
                             raise BridgeError("Invalid request")
                         request = json.loads(raw)
+                        raw = None
                         operation = request.get("op")
-                        if operation == "status":
-                            session.refresh()
-                            response = session.status()
+                        if session is not None and session.process.poll() is not None:
+                            session.close()
+                            session = None
+                        if operation == "open":
+                            candidate = open_request(request)
+                            previous = session
+                            session = candidate
+                            if previous is not None:
+                                previous.close()
+                            print("Database opened.", flush=True)
+                            response = {"opened": True, **session.status()}
+                        elif operation == "status":
+                            if session is None:
+                                response = {
+                                    "database_open": False, "unlocked": False,
+                                    "pid": os.getpid(), "cli_pid": None,
+                                    "auto_reload": True, "reload_count": 0, "reload_error": None,
+                                }
+                            else:
+                                session.refresh()
+                                response = session.status()
+                        elif operation == "stop":
+                            response = {"stopped": True}
+                            running = False
+                        elif operation not in {"reload", "search", "get"}:
+                            raise BridgeError("Unsupported operation")
+                        elif session is None:
+                            raise BridgeError("No database is open; use the open command first")
                         elif operation == "reload":
                             session.refresh(force=True)
                             if session.reload_error:
@@ -364,19 +407,19 @@ def serve(args):
                             entry = argument(request.get("entry"))
                             attribute = argument(request.get("attribute", "Password"))
                             response = {"value": session.execute("show -s -a " + attribute + " -- " + entry)}
-                        elif operation == "stop":
-                            response = {"stopped": True}
-                            running = False
-                        else:
-                            raise BridgeError("Unsupported operation")
                         response["ok"] = True
                     except SessionError as error:
                         response = {"ok": False, "error": str(error)}
-                        running = False
+                        if session is not None:
+                            session.close()
+                            session = None
                     except BridgeError as error:
                         response = {"ok": False, "error": str(error)}
                     except (ValueError, AttributeError, TypeError, OSError):
                         response = {"ok": False, "error": "Invalid request or disconnected CLI"}
+                    finally:
+                        raw = None
+                        request = None
                     try:
                         stream.write(json.dumps(response).encode() + b"\n")
                         stream.flush()
@@ -397,10 +440,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", type=Path, default=default_socket())
     commands = parser.add_subparsers(dest="operation", required=True)
-    start = commands.add_parser("serve", help="Unlock once and serve in the foreground")
-    start.add_argument("database", type=Path)
-    start.add_argument("--key-file", type=Path)
-    start.add_argument("--yubikey", help="KeePassXC YubiKey slot[:serial]")
+    commands.add_parser("serve", help="Serve without a database or terminal input")
+    opening = commands.add_parser("open", help="Unlock a database on the running daemon")
+    opening.add_argument("database", type=Path)
+    opening.add_argument("--key-file", type=Path)
+    opening.add_argument("--yubikey", help="KeePassXC YubiKey slot[:serial]")
     commands.add_parser("status", help="Check connection without reading an entry")
     commands.add_parser("reload", help="Reload the saved database using the in-memory unlock password")
     search = commands.add_parser("search", help="Search entries; output paths/titles only")
@@ -416,8 +460,31 @@ def main():
         def interrupted(*_):
             raise KeyboardInterrupt
         signal.signal(signal.SIGTERM, interrupted)
-        signal.signal(signal.SIGHUP, interrupted)
+        # Preserve nohup's inherited SIGHUP ignore when launched in the background.
+        if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+            signal.signal(signal.SIGHUP, interrupted)
         serve(args)
+    elif args.operation == "open":
+        if not sys.stdin.isatty():
+            raise BridgeError("Run open in a terminal to enter the password privately")
+        database = args.database.expanduser().absolute()
+        key_file = args.key_file.expanduser().absolute() if args.key_file else None
+        if not database.is_file() or (key_file is not None and not key_file.is_file()):
+            raise BridgeError("Database or key file does not exist")
+        status = exchange(args.socket, {"op": "status"})
+        if "database_open" not in status:
+            parser.error("The running daemon needs upgrading; restart it with serve before using open")
+        password = getpass.getpass("Database password (hidden): ")
+        request = {
+            "op": "open", "database": str(database), "password": password,
+            "key_file": str(key_file) if key_file else None, "yubikey": args.yubikey,
+        }
+        password = None
+        try:
+            response = exchange(args.socket, request)
+        finally:
+            request.clear()
+        print(json.dumps(response))
     elif args.operation == "run":
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", args.variable):

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "keepassxc-daemon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Read-only local KeePassXC CLI daemon with automatic database reload"
 readme = "README.md"
 requires-python = ">=3.11"
