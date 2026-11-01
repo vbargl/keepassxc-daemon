@@ -126,7 +126,7 @@ class Session:
         return chunks
 
     def execute(self, command):
-        marker = "__t3_boundary_" + secrets.token_hex(24)
+        marker = "__keepassxc_boundary_" + secrets.token_hex(24)
         wire = command.encode("utf-8")
         self.process.stdin.write(wire + b"\n" + marker.encode() + b"\n")
         self.process.stdin.flush()
@@ -271,7 +271,7 @@ class ReloadingSession:
 
 
 def default_socket():
-    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "t3-keepassxc" / "cli.sock"
+    return Path(os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")) / "keepassxc-daemon" / "cli.sock"
 
 
 def exchange(path, request):

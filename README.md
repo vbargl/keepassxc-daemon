@@ -130,8 +130,8 @@ Auto-Type, and remote sync remain desktop app responsibilities.
 
 ## Local API
 
-The default socket is `$XDG_RUNTIME_DIR/t3-keepassxc/cli.sock`, falling back to
-`/run/user/<uid>/t3-keepassxc/cli.sock`. The directory is mode 0700, the socket is
+The default socket is `$XDG_RUNTIME_DIR/keepassxc-daemon/cli.sock`, falling back to
+`/run/user/<uid>/keepassxc-daemon/cli.sock`. The directory is mode 0700, the socket is
 mode 0600, and peer UID checks restrict access to the same Unix user. There is no
 TCP listener. The empty `daemon.lock` file holds a lock and contains no secrets.
 
